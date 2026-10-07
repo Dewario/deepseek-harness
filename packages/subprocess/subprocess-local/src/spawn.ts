@@ -11,7 +11,7 @@
 import { type ChildProcess, type SpawnOptions, spawn, spawnSync } from 'node:child_process'
 import type { Readable } from 'node:stream'
 import { randomBytes } from 'node:crypto'
-import { closeSync, mkdtempSync, openSync, rmdirSync, unlinkSync, writeSync } from 'node:fs'
+import { closeSync, mkdirSync, mkdtempSync, openSync, rmdirSync, unlinkSync, writeSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { setTimeout as sleepMs } from 'node:timers/promises'
@@ -146,6 +146,8 @@ export class OutputCollector {
   private spillDisabled: boolean
   /** Total bytes ever pushed (not just retained). */
   private total = 0
+  /** Whether the one-shot spill-degradation warning has been emitted. */
+  private static spillWarned = false
 
   constructor(
     private readonly maxBytes: number,
@@ -194,18 +196,43 @@ export class OutputCollector {
       this.discardSpill()
       return
     }
-    if (this.spillFd === undefined) {
-      // Random suffix + O_EXCL + no-follow-equivalent ('wx' fails on any
-      // existing path, symlink or not) + owner-only mode: defeats spill-path
-      // prediction and symlink planting in shared tmp dirs.
-      this.spillFile = join(
-        this.spillDir,
-        `dsh-subprocess-${process.pid}-${++spillCounter}-${randomBytes(6).toString('hex')}-${this.label}.log`,
-      )
-      this.spillFd = openSync(this.spillFile, 'wx', 0o600)
-      for (const prior of this.chunks) writeSync(this.spillFd, prior)
+    try {
+      if (this.spillFd === undefined) {
+        // Random suffix + O_EXCL + no-follow-equivalent ('wx' fails on any
+        // existing path, symlink or not) + owner-only mode: defeats spill-path
+        // prediction and symlink planting in shared tmp dirs.
+        this.spillFile = join(
+          this.spillDir,
+          `dsh-subprocess-${process.pid}-${++spillCounter}-${randomBytes(6).toString('hex')}-${this.label}.log`,
+        )
+        this.spillFd = openSync(this.spillFile, 'wx', 0o600)
+        for (const prior of this.chunks) writeSync(this.spillFd, prior)
+      }
+      writeSync(this.spillFd, chunk)
+    } catch (error) {
+      // The spill dir is created once per process and assumed to persist;
+      // external temp cleaners (CCleaner, Storage Sense, cleanup scripts)
+      // violate that assumption mid-stream, and an uncaught ENOENT here
+      // escapes the stream 'data' handler and kills the whole harness.
+      // Degrade to the in-memory tail — the contract's truncated shape —
+      // and recreate the dir so later spills from any collector sharing
+      // this per-process dir succeed again.
+      this.discardSpill()
+      const code = (error as NodeJS.ErrnoException).code
+      if (code === 'ENOENT') {
+        try {
+          mkdirSync(this.spillDir, { recursive: true })
+        } catch {
+          // Unrecreatable dir: stay degraded; every in-memory read keeps working.
+        }
+      }
+      if (!OutputCollector.spillWarned) {
+        OutputCollector.spillWarned = true
+        console.warn(
+          `dsh-subprocess-local: output spill to ${this.spillDir} failed (${String(error)}); degraded to in-memory tail`,
+        )
+      }
     }
-    writeSync(this.spillFd, chunk)
   }
 
   /** Stop spilling and remove the file once it can no longer hold the complete stream. */

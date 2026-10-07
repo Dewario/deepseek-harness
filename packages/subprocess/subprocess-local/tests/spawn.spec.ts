@@ -1,5 +1,5 @@
 import { spawn as nodeSpawn, spawnSync as nodeSpawnSync } from 'node:child_process'
-import { mkdtempSync, readFileSync, rmSync, statSync, unlinkSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { afterAll, describe, expect, it, vi } from 'vitest'
@@ -611,6 +611,47 @@ describe('OutputCollector', () => {
     expect(failNextUnlink.value).toBe(false)
     expect(collector.finalize().spillPath).toBeUndefined()
     unlinkSync(spillPath)
+  })
+
+  it('degrades to the tail and recreates the dir when a cleaner deleted the spill dir', () => {
+    // The dir is never created: an external temp cleaner removed it before the
+    // first overflow. Without the guard this openSync ENOENT escapes the
+    // stream 'data' handler and kills the process.
+    const missing = join(spillDir, 'deleted-by-cleaner')
+    const collector = new OutputCollector(4, 100, 'cleaner-hit', missing)
+    let out: ReturnType<typeof collector.finalize>
+    expect(() => { collector.push(Buffer.from('a'.repeat(64))); out = collector.finalize() }).not.toThrow()
+    expect(out!.truncated).toBe(true)
+    expect(out!.text).toBe('a'.repeat(4))
+    expect(out!.spillPath).toBeUndefined()
+    expect(existsSync(missing)).toBe(true)
+  })
+
+  it('recovers spilling after the guard recreated a deleted spill dir', () => {
+    const missing = join(spillDir, 'recreated-then-recovered')
+    const first = new OutputCollector(4, 100, 'first', missing)
+    expect(() => { first.push(Buffer.from('a'.repeat(64))) }).not.toThrow()
+
+    const second = new OutputCollector(4, 100, 'second', missing)
+    second.push(Buffer.from('b'.repeat(64)))
+    const out = second.finalize()
+    expect(out.text).toBe('b'.repeat(4))
+    expect(readFileSync(out.spillPath!, 'utf8')).toBe('b'.repeat(64))
+    unlinkSync(out.spillPath!)
+  })
+
+  it('contains non-ENOENT spill failures and warns once across collectors', () => {
+    // An existing FILE where the spill dir should be: every open fails ENOTDIR
+    // on POSIX (not ENOENT), so the guard stays degraded without recreating.
+    const blocker = join(spillDir, 'blocker-file')
+    writeFileSync(blocker, '')
+    const first = new OutputCollector(4, 100, 'notdir-first', blocker)
+    expect(() => { first.push(Buffer.from('a'.repeat(64))) }).not.toThrow()
+    expect(first.finalize().spillPath).toBeUndefined()
+
+    const second = new OutputCollector(4, 100, 'notdir-second', blocker)
+    expect(() => { second.push(Buffer.from('b'.repeat(64))) }).not.toThrow()
+    expect(second.finalize().text).toBe('b'.repeat(4))
   })
 })
 
